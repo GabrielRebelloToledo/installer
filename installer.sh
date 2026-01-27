@@ -276,6 +276,16 @@ networks:
 
   ${PROXY_NET}:
     external: true
+
+secrets:
+  ${CLIENTE}_db_password_v1:
+    external: true
+  ${CLIENTE}_jwt_secret_v1:
+    external: true
+  ${CLIENTE}_master_key_v1:
+    external: true
+  ${CLIENTE}_update_hmac_v1:
+    external: true
 EOF
 
 # =========================
