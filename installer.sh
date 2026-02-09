@@ -17,70 +17,50 @@ set -euo pipefail
 # =========================================================
 
 # =========================
-# Inputs
+# Helpers (validação / util)
 # =========================
-read -rp "Docker Hub namespace [ex: datatechsistemas]: " DOCKERHUB_NS
+die() { echo "ERRO: $*" >&2; exit 1; }
 
-read -rp "Docker Hub username (para imagens privadas): " DOCKERHUB_USER
-read -rsp "Docker Hub Access Token (PAT) (read-only): " DOCKERHUB_TOKEN; echo
+trim() {
+  local s="${1:-}"
+  # remove espaços no início/fim
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf "%s" "$s"
+}
 
-read -rp "Base dir no HOST [default /opt/datatech]: " HOST_BASE_DIR
-HOST_BASE_DIR="${HOST_BASE_DIR:-/opt/datatech}"
+to_lower() {
+  printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
 
-read -rp "Cliente (slug) [ex: clienteA]: " CLIENTE
-read -rp "API domain [ex: api.cliente.com]: " API_DOMAIN
-read -rp "APP domain [ex: app.cliente.com]: " APP_DOMAIN
+require_nonempty() {
+  local v="$(trim "${2:-}")"
+  [[ -n "$v" ]] || die "$1 não pode ficar vazio."
+}
 
-read -rp "DB host (Postgres externo) [ex: 10.0.0.10]: " DB_HOST
-read -rp "DB port [default 5432]: " DB_PORT
-DB_PORT="${DB_PORT:-5432}"
-read -rp "DB name: " DB_NAME
-read -rp "DB user: " DB_USER
-read -rsp "DB password: " DB_PASSWORD; echo
+require_abs_path() {
+  local p="$(trim "${1:-}")"
+  [[ "$p" == /* ]] || die "Base dir no HOST precisa ser caminho absoluto (ex: /opt/datatech)."
+}
 
-read -rsp "JWT secret: " JWT_SECRET; echo
-read -rsp "Updater HMAC secret: " UPDATE_SECRET; echo
+require_slug() {
+  local s="$(trim "${1:-}")"
+  [[ "$s" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "Cliente (slug) inválido. Use somente a-z, 0-9, _ ou - (ex: cantina)."
+}
 
-read -rp "API version/tag [ex: 1.4.0]: " API_TAG
-read -rp "FRONT version/tag [ex: 1.4.0]: " FRONT_TAG
-read -rp "UPDATER version/tag [default 1.0.0]: " UPDATER_TAG
-UPDATER_TAG="${UPDATER_TAG:-1.0.0}"
+require_image_tag() {
+  # tag docker pode ter letras/números/._-
+  local t="$(trim "${1:-}")"
+  [[ "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Tag inválida: '$t' (use letras/números e . _ -)."
+}
 
-# =========================
-# Constantes
-# =========================
-API_PORT="3000"
-FRONT_PORT="80"
-
-# Imagens (Docker Hub público)
-API_IMAGE="${DOCKERHUB_NS}/datatech-api:${API_TAG}"
-FRONT_IMAGE="${DOCKERHUB_NS}/datatech-front:${FRONT_TAG}"
-UPDATER_IMAGE="${DOCKERHUB_NS}/datatech-updater:${UPDATER_TAG}"
-
-# Infra
-NPM_IMAGE="jc21/nginx-proxy-manager:2.11.3"
-INFRA_DIR="infra"
-INFRA_FILE="${INFRA_DIR}/infra-npm-stack.yml"
-INFRA_STACK_NAME="infra"
-PROXY_NET="proxy_net"
-
-# Host paths
-HOST_CLIENT_DIR="${HOST_BASE_DIR}/${CLIENTE}"
-
-# Container paths (fixo/padrão)
-CONTAINER_BASE_DIR="/opt/datatech"
-CONTAINER_CLIENT_DIR="${CONTAINER_BASE_DIR}/${CLIENTE}"
-
-# =========================
-# Helpers
-# =========================
 create_secret () {
   local NAME="$1"
   local VALUE="$2"
   if docker secret ls --format '{{.Name}}' | grep -qx "$NAME"; then
     echo "• Secret já existe: $NAME (skip)"
   else
-    printf "%s" "$VALUE" | docker secret create "$NAME" -
+    printf "%s" "$VALUE" | docker secret create "$NAME" - >/dev/null
     echo "• Secret criado: $NAME"
   fi
 }
@@ -97,16 +77,119 @@ PY
   fi
 }
 
-echo "• Fazendo login no Docker Hub (para puxar imagens privadas)..."
-echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USER}" --password-stdin >/dev/null
-echo "✔ Login OK"
+# =========================
+# Inputs
+# =========================
+read -rp "Docker Hub namespace [ex: datatechsistemas] [default datatechsistemas]: " DOCKERHUB_NS
+DOCKERHUB_NS="$(to_lower "$(trim "${DOCKERHUB_NS:-datatechsistemas}")")"
+require_nonempty "Docker Hub namespace" "$DOCKERHUB_NS"
+# namespace / repo deve ser lowercase (boa prática e evita referências inválidas)
+[[ "$DOCKERHUB_NS" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || die "Namespace inválido: '$DOCKERHUB_NS' (use lowercase, números, . _ -)."
+
+read -rp "Docker Hub username (para imagens privadas) [default ${DOCKERHUB_NS}]: " DOCKERHUB_USER
+DOCKERHUB_USER="$(trim "${DOCKERHUB_USER:-$DOCKERHUB_NS}")"
+require_nonempty "Docker Hub username" "$DOCKERHUB_USER"
+
+read -rsp "Docker Hub Access Token (PAT) (read-only) [vazio se imagens públicas]: " DOCKERHUB_TOKEN; echo
+
+read -rp "Base dir no HOST [default /opt/datatech]: " HOST_BASE_DIR
+HOST_BASE_DIR="$(trim "${HOST_BASE_DIR:-/opt/datatech}")"
+require_abs_path "$HOST_BASE_DIR"
+
+read -rp "Cliente (slug) [ex: clienteA]: " CLIENTE
+CLIENTE="$(to_lower "$(trim "$CLIENTE")")"
+require_nonempty "Cliente (slug)" "$CLIENTE"
+require_slug "$CLIENTE"
+
+read -rp "API domain [ex: api.cliente.com]: " API_DOMAIN
+API_DOMAIN="$(trim "$API_DOMAIN")"
+require_nonempty "API domain" "$API_DOMAIN"
+
+read -rp "APP domain [ex: app.cliente.com]: " APP_DOMAIN
+APP_DOMAIN="$(trim "$APP_DOMAIN")"
+require_nonempty "APP domain" "$APP_DOMAIN"
+
+read -rp "DB host (Postgres externo) [ex: 10.0.0.10]: " DB_HOST
+DB_HOST="$(trim "$DB_HOST")"
+require_nonempty "DB host" "$DB_HOST"
+
+read -rp "DB port [default 5432]: " DB_PORT
+DB_PORT="$(trim "${DB_PORT:-5432}")"
+[[ "$DB_PORT" =~ ^[0-9]+$ ]] || die "DB port inválida: '$DB_PORT'"
+
+read -rp "DB name: " DB_NAME
+DB_NAME="$(trim "$DB_NAME")"
+require_nonempty "DB name" "$DB_NAME"
+
+read -rp "DB user: " DB_USER
+DB_USER="$(trim "$DB_USER")"
+require_nonempty "DB user" "$DB_USER"
+
+read -rsp "DB password: " DB_PASSWORD; echo
+require_nonempty "DB password" "$DB_PASSWORD"
+
+read -rsp "JWT secret (recomendo openssl rand -hex 32): " JWT_SECRET; echo
+require_nonempty "JWT secret" "$JWT_SECRET"
+
+read -rsp "Updater HMAC secret (recomendo openssl rand -hex 32): " UPDATE_SECRET; echo
+require_nonempty "Updater HMAC secret" "$UPDATE_SECRET"
+
+read -rp "API version/tag [ex: 1.4.0]: " API_TAG
+API_TAG="$(trim "$API_TAG")"
+require_nonempty "API version/tag" "$API_TAG"
+require_image_tag "$API_TAG"
+
+read -rp "FRONT version/tag [ex: 1.4.0]: " FRONT_TAG
+FRONT_TAG="$(trim "$FRONT_TAG")"
+require_nonempty "FRONT version/tag" "$FRONT_TAG"
+require_image_tag "$FRONT_TAG"
+
+read -rp "UPDATER version/tag [default 1.0.0]: " UPDATER_TAG
+UPDATER_TAG="$(trim "${UPDATER_TAG:-1.0.0}")"
+require_image_tag "$UPDATER_TAG"
+
+# =========================
+# Constantes
+# =========================
+API_PORT="3000"
+FRONT_PORT="80"
+
+# Imagens
+API_IMAGE="${DOCKERHUB_NS}/datatech-api:${API_TAG}"
+FRONT_IMAGE="${DOCKERHUB_NS}/datatech-front:${FRONT_TAG}"
+UPDATER_IMAGE="${DOCKERHUB_NS}/datatech-updater:${UPDATER_TAG}"
+
+# Infra
+NPM_IMAGE="jc21/nginx-proxy-manager:2.11.3"
+INFRA_DIR="infra"
+INFRA_FILE="${INFRA_DIR}/infra-npm-stack.yml"
+INFRA_STACK_NAME="infra"
+PROXY_NET="proxy_net"
+
+# Host paths
+HOST_CLIENT_DIR="${HOST_BASE_DIR}/${CLIENTE}"
+
+# Container paths (padrão)
+CONTAINER_BASE_DIR="/opt/datatech"
+CONTAINER_CLIENT_DIR="${CONTAINER_BASE_DIR}/${CLIENTE}"
+
+# =========================
+# Login Docker Hub (se token foi informado)
+# =========================
+if [[ -n "$(trim "${DOCKERHUB_TOKEN}")" ]]; then
+  echo "• Fazendo login no Docker Hub (para puxar imagens privadas)..."
+  echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USER}" --password-stdin >/dev/null
+  echo "✔ Login OK"
+else
+  echo "• Sem PAT informado: seguindo sem docker login (imagens públicas)."
+fi
 
 # =========================
 # 1) Swarm
 # =========================
 if ! docker info 2>/dev/null | grep -q "Swarm: active"; then
   echo "• Inicializando Docker Swarm..."
-  docker swarm init
+  docker swarm init >/dev/null
 else
   echo "• Swarm já ativo."
 fi
@@ -116,7 +199,7 @@ fi
 # =========================
 if ! docker network ls --format '{{.Name}}' | grep -qx "${PROXY_NET}"; then
   echo "• Criando rede overlay ${PROXY_NET}..."
-  docker network create --driver overlay --attachable "${PROXY_NET}"
+  docker network create --driver overlay --attachable "${PROXY_NET}" >/dev/null
 else
   echo "• Rede ${PROXY_NET} já existe."
 fi
@@ -157,14 +240,12 @@ EOF
 
 echo "✔ Gerado: ${INFRA_FILE}"
 echo "• Deploy do Nginx Proxy Manager stack (${INFRA_STACK_NAME})..."
-docker stack deploy -c "${INFRA_FILE}" "${INFRA_STACK_NAME}"
+docker stack deploy -c "${INFRA_FILE}" "${INFRA_STACK_NAME}" >/dev/null || true
 
 # =========================
 # 4) Diretórios do cliente no HOST (persistência)
 # =========================
-mkdir -p "${HOST_CLIENT_DIR}"
-mkdir -p "${HOST_CLIENT_DIR}/data/uploads"
-mkdir -p "${HOST_CLIENT_DIR}/certs"
+mkdir -p "${HOST_CLIENT_DIR}/data/uploads" "${HOST_CLIENT_DIR}/certs"
 
 # =========================
 # 5) Secrets v1 (por cliente)
@@ -186,25 +267,24 @@ services:
   api:
     image: ${API_IMAGE}
     environment:
-      SPRING_PROFILES_ACTIVE: prod
-      CLIENTE: ${CLIENTE}
+      SPRING_PROFILES_ACTIVE: "prod"
+      CLIENTE: "${CLIENTE}"
 
       SERVER_PORT: "${API_PORT}"
 
-      DB_HOST: ${DB_HOST}
+      DB_HOST: "${DB_HOST}"
       DB_PORT: "${DB_PORT}"
-      DB_NAME: ${DB_NAME}
-      DB_USER: ${DB_USER}
+      DB_NAME: "${DB_NAME}"
+      DB_USER: "${DB_USER}"
 
-      DB_PASSWORD_FILE: /run/secrets/db_password
-      JWT_SECRET_FILE: /run/secrets/jwt_secret
-      MASTER_KEY_FILE: /run/secrets/master_key
+      DB_PASSWORD_FILE: "/run/secrets/db_password"
+      JWT_SECRET_FILE: "/run/secrets/jwt_secret"
+      MASTER_KEY_FILE: "/run/secrets/master_key"
 
-      # PADRÃO dentro do container
-      STORAGE_BASE: ${CONTAINER_BASE_DIR}
-      RELATORIOS_PATH: ${CONTAINER_CLIENT_DIR}/data/uploads
+      STORAGE_BASE: "${CONTAINER_BASE_DIR}"
+      RELATORIOS_PATH: "${CONTAINER_CLIENT_DIR}/data/uploads"
 
-      UPDATE_URL: http://updater:9100/update
+      UPDATE_URL: "http://updater:9100/update"
 
     secrets:
       - source: ${CLIENTE}_db_password_v1
@@ -217,7 +297,6 @@ services:
         target: update_hmac
 
     volumes:
-      # HOST -> container sempre em /opt/datatech/<cliente>
       - ${HOST_CLIENT_DIR}:${CONTAINER_CLIENT_DIR}
 
     networks:
@@ -244,8 +323,8 @@ services:
   updater:
     image: ${UPDATER_IMAGE}
     environment:
-      CLIENTE: ${CLIENTE}
-      STACK_NAME: ${CLIENTE}
+      CLIENTE: "${CLIENTE}"
+      STACK_NAME: "${CLIENTE}"
 
       API_HEALTH_URL: "http://api:${API_PORT}/actuator/health"
       FRONT_HEALTH_URL: "http://frontend:${FRONT_PORT}/"
@@ -288,9 +367,12 @@ secrets:
     external: true
 EOF
 
+echo "✔ Stack gerado: ${HOST_CLIENT_DIR}/stack.yml"
+
 # =========================
 # 7) Deploy do cliente
 # =========================
+echo "• Deploy do cliente (${CLIENTE})..."
 docker stack deploy --with-registry-auth -c "${HOST_CLIENT_DIR}/stack.yml" "${CLIENTE}"
 
 echo
