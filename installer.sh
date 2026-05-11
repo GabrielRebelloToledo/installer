@@ -7,8 +7,15 @@ set -euo pipefail
 #
 # - Gera infra/infra-npm-stack.yml
 # - Sobe infra (Nginx Proxy Manager)
-# - Cria secrets v1 do cliente (db_password, jwt_secret, update_hmac, master_key)
-# - Gera <HOST_BASE_DIR>/<cliente>/stack.yml (api + frontend + updater)
+# - Cria secrets v1 do cliente:
+#     <slug>_db_password_v1
+#     <slug>_jwt_secret_v1
+#     <slug>_saas_crypto_secret_key_v1
+# - Gera <HOST_BASE_DIR>/<cliente>/stack.yml (api + frontend)
+#
+# Deploy contínuo é via GitHub Actions (SSH + docker service update). O service
+# `updater` foi removido — o GA faz o mesmo trabalho com mais visibilidade
+# (logs, retry, manual approval pra prod).
 #
 # PADRÕES:
 # - API porta interna fixa: 3000
@@ -23,7 +30,6 @@ die() { echo "ERRO: $*" >&2; exit 1; }
 
 trim() {
   local s="${1:-}"
-  # remove espaços no início/fim
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   printf "%s" "$s"
@@ -49,7 +55,6 @@ require_slug() {
 }
 
 require_image_tag() {
-  # tag docker pode ter letras/números/._-
   local t="$(trim "${1:-}")"
   [[ "$t" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Tag inválida: '$t' (use letras/números e . _ -)."
 }
@@ -83,8 +88,7 @@ PY
 read -rp "Docker Hub namespace [ex: datatechsistemas] [default datatechsistemas]: " DOCKERHUB_NS
 DOCKERHUB_NS="$(to_lower "$(trim "${DOCKERHUB_NS:-datatechsistemas}")")"
 require_nonempty "Docker Hub namespace" "$DOCKERHUB_NS"
-# namespace / repo deve ser lowercase (boa prática e evita referências inválidas)
-[[ "$DOCKERHUB_NS" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || die "Namespace inválido: '$DOCKERHUB_NS' (use lowercase, números, . _ -)."
+[[ "$DOCKERHUB_NS" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || die "Namespace inválido: '$DOCKERHUB_NS'."
 
 read -rp "Docker Hub username (para imagens privadas) [default ${DOCKERHUB_NS}]: " DOCKERHUB_USER
 DOCKERHUB_USER="$(trim "${DOCKERHUB_USER:-$DOCKERHUB_NS}")"
@@ -109,8 +113,8 @@ read -rp "APP domain [ex: app.cliente.com]: " APP_DOMAIN
 APP_DOMAIN="$(trim "$APP_DOMAIN")"
 require_nonempty "APP domain" "$APP_DOMAIN"
 
-read -rp "DB host (Postgres externo) [ex: 10.0.0.10]: " DB_HOST
-DB_HOST="$(trim "$DB_HOST")"
+read -rp "DB host (Postgres bare metal) [default 127.0.0.1]: " DB_HOST
+DB_HOST="$(trim "${DB_HOST:-127.0.0.1}")"
 require_nonempty "DB host" "$DB_HOST"
 
 read -rp "DB port [default 5432]: " DB_PORT
@@ -131,9 +135,6 @@ require_nonempty "DB password" "$DB_PASSWORD"
 read -rsp "JWT secret (recomendo openssl rand -hex 32): " JWT_SECRET; echo
 require_nonempty "JWT secret" "$JWT_SECRET"
 
-read -rsp "Updater HMAC secret (recomendo openssl rand -hex 32): " UPDATE_SECRET; echo
-require_nonempty "Updater HMAC secret" "$UPDATE_SECRET"
-
 read -rp "API version/tag [ex: 1.4.0]: " API_TAG
 API_TAG="$(trim "$API_TAG")"
 require_nonempty "API version/tag" "$API_TAG"
@@ -144,32 +145,22 @@ FRONT_TAG="$(trim "$FRONT_TAG")"
 require_nonempty "FRONT version/tag" "$FRONT_TAG"
 require_image_tag "$FRONT_TAG"
 
-read -rp "UPDATER version/tag [default 1.0.0]: " UPDATER_TAG
-UPDATER_TAG="$(trim "${UPDATER_TAG:-1.0.0}")"
-require_image_tag "$UPDATER_TAG"
-
 # =========================
 # Constantes
 # =========================
 API_PORT="3000"
 FRONT_PORT="80"
 
-# Imagens
 API_IMAGE="${DOCKERHUB_NS}/datatech-api:${API_TAG}"
 FRONT_IMAGE="${DOCKERHUB_NS}/datatech-front:${FRONT_TAG}"
-UPDATER_IMAGE="${DOCKERHUB_NS}/datatech-updater:${UPDATER_TAG}"
 
-# Infra
 NPM_IMAGE="jc21/nginx-proxy-manager:2.11.3"
 INFRA_DIR="infra"
 INFRA_FILE="${INFRA_DIR}/infra-npm-stack.yml"
 INFRA_STACK_NAME="infra"
 PROXY_NET="proxy_net"
 
-# Host paths
 HOST_CLIENT_DIR="${HOST_BASE_DIR}/${CLIENTE}"
-
-# Container paths (padrão)
 CONTAINER_BASE_DIR="/opt/datatech"
 CONTAINER_CLIENT_DIR="${CONTAINER_BASE_DIR}/${CLIENTE}"
 
@@ -252,10 +243,9 @@ mkdir -p "${HOST_CLIENT_DIR}/data/uploads" "${HOST_CLIENT_DIR}/certs"
 # =========================
 create_secret "${CLIENTE}_db_password_v1" "$DB_PASSWORD"
 create_secret "${CLIENTE}_jwt_secret_v1" "$JWT_SECRET"
-create_secret "${CLIENTE}_update_hmac_v1" "$UPDATE_SECRET"
 
-MASTER_KEY_B64="$(gen_master_key_b64)"
-create_secret "${CLIENTE}_master_key_v1" "$MASTER_KEY_B64"
+CRYPTO_KEY_B64="$(gen_master_key_b64)"
+create_secret "${CLIENTE}_saas_crypto_secret_key_v1" "$CRYPTO_KEY_B64"
 
 # =========================
 # 6) Gerar stack do cliente (salva no HOST_CLIENT_DIR)
@@ -279,22 +269,18 @@ services:
 
       DB_PASSWORD_FILE: "/run/secrets/db_password"
       JWT_SECRET_FILE: "/run/secrets/jwt_secret"
-      MASTER_KEY_FILE: "/run/secrets/master_key"
+      SAAS_CRYPTO_SECRET_KEY_FILE: "/run/secrets/saas_crypto_secret_key"
 
       STORAGE_BASE: "${CONTAINER_BASE_DIR}"
       RELATORIOS_PATH: "${CONTAINER_CLIENT_DIR}/data/uploads"
-
-      UPDATE_URL: "http://updater:9100/update"
 
     secrets:
       - source: ${CLIENTE}_db_password_v1
         target: db_password
       - source: ${CLIENTE}_jwt_secret_v1
         target: jwt_secret
-      - source: ${CLIENTE}_master_key_v1
-        target: master_key
-      - source: ${CLIENTE}_update_hmac_v1
-        target: update_hmac
+      - source: ${CLIENTE}_saas_crypto_secret_key_v1
+        target: saas_crypto_secret_key
 
     volumes:
       - ${HOST_CLIENT_DIR}:${CONTAINER_CLIENT_DIR}
@@ -303,10 +289,29 @@ services:
       - ${PROXY_NET}
       - ${CLIENTE}_net
 
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${API_PORT}/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
     deploy:
       replicas: 1
+      update_config:
+        # GitHub Actions emite docker service update; essa config faz Swarm
+        # esperar o novo container ficar healthy antes de matar o antigo. Se
+        # falhar, rollback automático pra imagem anterior.
+        order: start-first
+        failure_action: rollback
+        monitor: 60s
+        max_failure_ratio: 0.0
+      rollback_config:
+        order: start-first
+        monitor: 30s
       restart_policy:
         condition: on-failure
+        max_attempts: 3
 
   frontend:
     image: ${FRONT_IMAGE}
@@ -315,39 +320,25 @@ services:
     networks:
       - ${PROXY_NET}
       - ${CLIENTE}_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${FRONT_PORT}/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     deploy:
       replicas: 1
+      update_config:
+        order: start-first
+        failure_action: rollback
+        monitor: 30s
+        max_failure_ratio: 0.0
+      rollback_config:
+        order: start-first
+        monitor: 15s
       restart_policy:
         condition: on-failure
-
-  updater:
-    image: ${UPDATER_IMAGE}
-    environment:
-      CLIENTE: "${CLIENTE}"
-      STACK_NAME: "${CLIENTE}"
-
-      API_HEALTH_URL: "http://api:${API_PORT}/actuator/health"
-      FRONT_HEALTH_URL: "http://frontend:${FRONT_PORT}/"
-
-      MAX_SKEW_SECONDS: "120"
-      HEALTH_RETRIES: "30"
-      HEALTH_INTERVAL_MS: "2000"
-
-    secrets:
-      - source: ${CLIENTE}_update_hmac_v1
-        target: update_hmac
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ${HOST_CLIENT_DIR}:${CONTAINER_CLIENT_DIR}
-
-    networks:
-      - ${CLIENTE}_net
-
-    deploy:
-      replicas: 1
-      restart_policy:
-        condition: on-failure
+        max_attempts: 3
 
 networks:
   ${CLIENTE}_net:
@@ -361,9 +352,7 @@ secrets:
     external: true
   ${CLIENTE}_jwt_secret_v1:
     external: true
-  ${CLIENTE}_master_key_v1:
-    external: true
-  ${CLIENTE}_update_hmac_v1:
+  ${CLIENTE}_saas_crypto_secret_key_v1:
     external: true
 EOF
 
@@ -385,7 +374,6 @@ echo
 echo "Imagens:"
 echo " - API:     ${API_IMAGE}"
 echo " - FRONT:   ${FRONT_IMAGE}"
-echo " - UPDATER: ${UPDATER_IMAGE}"
 echo
 echo "Arquivos do cliente:"
 echo " - Stack:   ${HOST_CLIENT_DIR}/stack.yml"
@@ -405,3 +393,5 @@ echo "     Forward Port:     3000"
 echo
 echo "IMPORTANTE: DNS de ${APP_DOMAIN} e ${API_DOMAIN} devem apontar para o IP público do servidor."
 echo "           Portas 80 e 443 precisam estar abertas para emissão do certificado."
+echo
+echo "Deploy contínuo: configure GitHub Actions seguindo api-saas/infra/CICD.md"
